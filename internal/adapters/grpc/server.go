@@ -92,9 +92,10 @@ func (s *Server) ValidateToken(ctx context.Context, req *pluginsv1.ValidateToken
 	}
 	return &pluginsv1.ValidateTokenResponse{
 		Claims: &pluginsv1.TokenClaims{
-			Subject: claims.Subject,
-			Email:   claims.Email,
-			Roles:   claims.Roles,
+			Subject:  claims.Subject,
+			Username: claims.Username,
+			Email:    claims.Email,
+			Roles:    claims.Roles,
 		},
 	}, nil
 }

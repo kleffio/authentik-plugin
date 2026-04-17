@@ -83,10 +83,12 @@ func (c *Client) ValidateToken(ctx context.Context, rawToken string) (*domain.To
 	}
 
 	var claims struct {
-		Sub   string   `json:"sub"`
-		Email string   `json:"email"`
-		Exp   int64    `json:"exp"`
-		Roles []string `json:"roles"`
+		Sub               string   `json:"sub"`
+		Email             string   `json:"email"`
+		Exp               int64    `json:"exp"`
+		PreferredUsername string   `json:"preferred_username"`
+		Name              string   `json:"name"`
+		Roles             []string `json:"roles"`
 		// Authentik puts groups in the "groups" claim
 		Groups []string `json:"groups"`
 	}
@@ -100,8 +102,13 @@ func (c *Client) ValidateToken(ctx context.Context, rawToken string) (*domain.To
 		return nil, &domain.ErrUnauthorized{Msg: "token expired"}
 	}
 
+	username := claims.PreferredUsername
+	if username == "" {
+		username = claims.Name
+	}
+
 	roles := append(claims.Roles, claims.Groups...)
-	return &domain.TokenClaims{Subject: claims.Sub, Email: claims.Email, Roles: roles}, nil
+	return &domain.TokenClaims{Subject: claims.Sub, Email: claims.Email, Roles: roles, Username: username}, nil
 }
 
 func (c *Client) getKey(ctx context.Context, kid string) (crypto.PublicKey, error) {

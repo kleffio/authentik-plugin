@@ -3,7 +3,7 @@ module github.com/kleffio/idp-authentik
 go 1.25.0
 
 require (
-	github.com/kleffio/plugin-sdk-go v0.1.2
+	github.com/kleffio/plugin-sdk-go v0.1.6
 	google.golang.org/grpc v1.64.0
 )
 

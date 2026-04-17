@@ -12,9 +12,10 @@ type TokenSet struct {
 
 // TokenClaims carries verified identity extracted from a validated JWT.
 type TokenClaims struct {
-	Subject string
-	Email   string
-	Roles   []string
+	Subject  string
+	Username string
+	Email    string
+	Roles    []string
 }
 
 // OIDCConfig holds the OIDC discovery parameters the frontend needs.
