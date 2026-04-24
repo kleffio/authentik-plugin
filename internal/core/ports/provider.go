@@ -34,4 +34,10 @@ type IDPProvider interface {
 	// EnsureAdmin seeds the initial admin user and grants them the "admin" group.
 	// Safe to call multiple times (idempotent).
 	EnsureAdmin(ctx context.Context) error
+	// ChangePassword verifies currentPassword for userID then sets newPassword.
+	// Returns ErrUnauthorized if currentPassword is wrong.
+	ChangePassword(ctx context.Context, userID, currentPassword, newPassword string) error
+
+	ListSessions(ctx context.Context, userID string) ([]*domain.Session, error)
+	RevokeSession(ctx context.Context, userID, sessionID string) error
 }

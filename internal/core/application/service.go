@@ -40,3 +40,15 @@ func (s *Service) RefreshToken(ctx context.Context, refreshToken string) (*domai
 func (s *Service) EnsureAdmin(ctx context.Context) error {
 	return s.provider.EnsureAdmin(ctx)
 }
+
+func (s *Service) ChangePassword(ctx context.Context, userID, currentPassword, newPassword string) error {
+	return s.provider.ChangePassword(ctx, userID, currentPassword, newPassword)
+}
+
+func (s *Service) ListSessions(ctx context.Context, userID string) ([]*domain.Session, error) {
+	return s.provider.ListSessions(ctx, userID)
+}
+
+func (s *Service) RevokeSession(ctx context.Context, userID, sessionID string) error {
+	return s.provider.RevokeSession(ctx, userID, sessionID)
+}
