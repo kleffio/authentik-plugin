@@ -3,6 +3,7 @@
 package authentik
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -29,14 +30,18 @@ type Config struct {
 	AdminEmail     string // email of the initial Kleff admin user
 	AdminPassword  string // password of the initial Kleff admin user
 	AuthMode       string // "headless" (default) or "redirect"
+	PanelURL       string // public panel URL, e.g. "https://panel.example.com"; used to register the OIDC callback
 }
 
 // cachedEndpoints are discovered after EnsureSetup completes.
 type cachedEndpoints struct {
-	tokenEndpoint string
-	jwksURI       string
-	issuerURL     string
-	clientID      string
+	tokenEndpoint         string
+	internalTokenEndpoint string
+	jwksURI               string
+	issuerURL             string // public URL returned to browser
+	tokenIssuer           string // actual iss Authentik stamps on tokens (from discovery doc)
+	clientID              string
+	endSessionEndpoint    string
 }
 
 // Client implements ports.IDPProvider for Authentik.
@@ -44,9 +49,10 @@ type Client struct {
 	cfg  Config
 	http *http.Client
 
-	mu       sync.RWMutex
-	ep       cachedEndpoints
-	epReady  bool
+	mu              sync.RWMutex
+	ep              cachedEndpoints
+	epReady         bool
+	revokedSessions map[string]time.Time
 }
 
 // New creates a Client. Call EnsureSetup before performing auth operations.
@@ -58,8 +64,9 @@ func New(cfg Config) *Client {
 		cfg.AuthMode = "headless"
 	}
 	return &Client{
-		cfg:  cfg,
-		http: &http.Client{Timeout: 15 * time.Second},
+		cfg:             cfg,
+		http:            &http.Client{Timeout: 15 * time.Second},
+		revokedSessions: map[string]time.Time{},
 	}
 }
 
@@ -81,9 +88,9 @@ func (c *Client) EnsureSetup(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("find auth flow: %w", err)
 	}
-	authzFlowPK, err := c.findFlowPK(ctx, base, tok, "default-provider-authorization-implicit-consent")
+	authzFlowPK, err := c.ensureHeadlessAuthzFlow(ctx, base, tok)
 	if err != nil {
-		return fmt.Errorf("find authz flow: %w", err)
+		return fmt.Errorf("ensure headless authz flow: %w", err)
 	}
 	invalidationFlowPK, err := c.findFlowPK(ctx, base, tok, "default-provider-invalidation-flow")
 	if err != nil {
@@ -127,8 +134,7 @@ func (c *Client) EnsureSetup(ctx context.Context) error {
 
 	// 9. Seed the admin user and "admin" group.
 	if err := c.EnsureAdmin(ctx); err != nil {
-		// Non-fatal — log and continue.
-		fmt.Printf("authentik: warning: EnsureAdmin: %v\n", err)
+		// Non-fatal: startup can continue even if admin seeding fails.
 	}
 
 	return nil
@@ -151,6 +157,50 @@ func (c *Client) waitReady(ctx context.Context, base, tok string) error {
 		case <-time.After(3 * time.Second):
 		}
 	}
+}
+
+func (c *Client) ensureHeadlessAuthzFlow(ctx context.Context, base, tok string) (string, error) {
+	// First check if it exists
+	u := base + "/api/v3/flows/instances/?slug=kleff-headless-authz"
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var page struct {
+		Results []struct {
+			PK string `json:"pk"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&page); err == nil && len(page.Results) > 0 {
+		return page.Results[0].PK, nil
+	}
+
+	// Create it if not found
+	payload := map[string]string{
+		"name":        "Kleff Headless Authorization",
+		"slug":        "kleff-headless-authz",
+		"designation": "authorization",
+		"title":       "Kleff Headless Authorization",
+	}
+	b, _ := json.Marshal(payload)
+	req2, _ := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/v3/flows/instances/", bytes.NewReader(b))
+	req2.Header.Set("Authorization", "Bearer "+tok)
+	req2.Header.Set("Content-Type", "application/json")
+	resp2, err := c.http.Do(req2)
+	if err != nil {
+		return "", err
+	}
+	defer resp2.Body.Close()
+	var res struct {
+		PK string `json:"pk"`
+	}
+	if err := json.NewDecoder(resp2.Body).Decode(&res); err != nil {
+		return "", err
+	}
+	return res.PK, nil
 }
 
 func (c *Client) findFlowPK(ctx context.Context, base, tok, slug string) (string, error) {
@@ -181,6 +231,7 @@ func (c *Client) findScopePKs(ctx context.Context, base, tok string) ([]string, 
 		"goauthentik.io/providers/oauth2/scope-openid",
 		"goauthentik.io/providers/oauth2/scope-email",
 		"goauthentik.io/providers/oauth2/scope-profile",
+		"goauthentik.io/providers/oauth2/scope-offline_access",
 	}
 	var pks []string
 	for _, m := range managed {
@@ -252,6 +303,16 @@ func (c *Client) ensureProvider(ctx context.Context, base, tok, authFlowPK, auth
 	}
 	resp.Body.Close()
 
+	redirectURIs := []map[string]string{
+		{"matching_mode": "strict", "url": "http://localhost/callback"},
+	}
+	if panelURL := strings.TrimRight(c.cfg.PanelURL, "/"); panelURL != "" {
+		redirectURIs = append(redirectURIs, map[string]string{
+			"matching_mode": "strict",
+			"url":           panelURL + "/auth/callback",
+		})
+	}
+
 	providerPayload := map[string]any{
 		"name":                       "kleff",
 		"client_id":                  "kleff-panel",
@@ -262,21 +323,23 @@ func (c *Client) ensureProvider(ctx context.Context, base, tok, authFlowPK, auth
 		"sub_mode":                   "user_email",
 		"include_claims_in_id_token": true,
 		"property_mappings":          scopePKs,
-		"access_token_validity":      "hours=1",
+		"access_token_validity":      "minutes=5",
 		"refresh_token_validity":     "days=30",
-		"redirect_uris": []map[string]string{
-			{"matching_mode": "regex", "url": ".*"},
-		},
-		"signing_key": certPK,
-		"jwt_alg":     "RS256",
+		"redirect_uris":              redirectURIs,
+		"signing_key":                certPK,
+		"jwt_alg":                    "RS256",
 	}
 
 	if len(page.Results) > 0 {
-		// Provider exists — PATCH to ensure RS256 signing is set.
+		// Provider exists — PATCH to ensure critical fields are set correctly.
 		pk := page.Results[0].PK
 		patchPayload, _ := json.Marshal(map[string]any{
-			"signing_key": certPK,
-			"jwt_alg":     "RS256",
+			"signing_key":           certPK,
+			"jwt_alg":               "RS256",
+			"authorization_flow":    authzFlowPK,
+			"property_mappings":     scopePKs,
+			"access_token_validity": "minutes=5",
+			"redirect_uris":         redirectURIs,
 		})
 		patchReq, _ := http.NewRequestWithContext(ctx, http.MethodPatch,
 			fmt.Sprintf("%s/api/v3/providers/oauth2/%d/", base, pk),
@@ -285,12 +348,12 @@ func (c *Client) ensureProvider(ctx context.Context, base, tok, authFlowPK, auth
 		patchReq.Header.Set("Content-Type", "application/json")
 		patchResp, err := c.http.Do(patchReq)
 		if err != nil {
-			return 0, fmt.Errorf("patch provider RS256: %w", err)
+			return 0, fmt.Errorf("patch provider: %w", err)
 		}
 		b, _ := io.ReadAll(patchResp.Body)
 		patchResp.Body.Close()
 		if patchResp.StatusCode != http.StatusOK {
-			return 0, fmt.Errorf("patch provider RS256: status %d: %s", patchResp.StatusCode, string(b))
+			return 0, fmt.Errorf("patch provider: status %d: %s", patchResp.StatusCode, string(b))
 		}
 		return pk, nil
 	}
@@ -382,12 +445,13 @@ func (c *Client) discoverEndpoints(ctx context.Context, base string) error {
 		return fmt.Errorf("OIDC discovery: status %d", resp.StatusCode)
 	}
 	var doc struct {
-		Issuer        string `json:"issuer"`
-		TokenEndpoint string `json:"token_endpoint"`
-		JwksURI       string `json:"jwks_uri"`
+		Issuer             string `json:"issuer"`
+		TokenEndpoint      string `json:"token_endpoint"`
+		JwksURI            string `json:"jwks_uri"`
+		EndSessionEndpoint string `json:"end_session_endpoint"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
-		return err
+		return fmt.Errorf("OIDC discovery decode: %w", err)
 	}
 
 	// Build public-facing issuer URL (browser-reachable).
@@ -397,13 +461,28 @@ func (c *Client) discoverEndpoints(ctx context.Context, base string) error {
 	}
 	publicIssuer := fmt.Sprintf("%s/application/o/%s/", publicBase, c.cfg.AppSlug)
 	publicJwks := fmt.Sprintf("%s/application/o/%s/jwks/", publicBase, c.cfg.AppSlug)
+	publicTokenEndpoint := fmt.Sprintf("%s/application/o/token/", publicBase)
+	publicEndSessionEndpoint := doc.EndSessionEndpoint
+	if publicEndSessionEndpoint == "" {
+		publicEndSessionEndpoint = fmt.Sprintf("%s/application/o/%s/end-session/", publicBase, c.cfg.AppSlug)
+	} else {
+		publicEndSessionEndpoint = strings.Replace(publicEndSessionEndpoint, strings.TrimRight(base, "/"), publicBase, 1)
+	}
+
+	tokenIssuer := doc.Issuer
+	if tokenIssuer == "" {
+		tokenIssuer = publicIssuer
+	}
 
 	c.mu.Lock()
 	c.ep = cachedEndpoints{
-		tokenEndpoint: doc.TokenEndpoint,
-		jwksURI:       publicJwks,
-		issuerURL:     publicIssuer,
-		clientID:      "kleff-panel",
+		tokenEndpoint:         publicTokenEndpoint,
+		internalTokenEndpoint: doc.TokenEndpoint,
+		jwksURI:               publicJwks,
+		issuerURL:             publicIssuer,
+		tokenIssuer:           tokenIssuer,
+		clientID:              "kleff-panel",
+		endSessionEndpoint:    publicEndSessionEndpoint,
 	}
 	c.epReady = true
 	c.mu.Unlock()
@@ -864,7 +943,7 @@ func (c *Client) Login(ctx context.Context, username, password string) (*domain.
 		"%s/application/o/authorize/?client_id=%s&response_type=code&scope=%s&redirect_uri=%s&state=%s&nonce=%s&code_challenge=%s&code_challenge_method=S256",
 		base,
 		url.QueryEscape("kleff-panel"),
-		url.QueryEscape("openid profile email"),
+		url.QueryEscape("openid profile email offline_access"),
 		url.QueryEscape(redirectURI),
 		state, nonce,
 		codeChallenge,
@@ -880,6 +959,165 @@ func (c *Client) Login(ctx context.Context, username, password string) (*domain.
 		return nil, fmt.Errorf("authentik login: expected auth redirect, got status %d", resp.StatusCode)
 	}
 	location := resp.Header.Get("Location")
+	if location == "" {
+		return nil, fmt.Errorf("authentik login: missing redirect location from authorize response")
+	}
+	handleFlowRedirect := func(raw string) (string, error) {
+		if raw == "" {
+			return "", fmt.Errorf("authentik login: flow redirect missing destination")
+		}
+		followURL := raw
+		if !strings.HasPrefix(followURL, "http") {
+			followURL = base + followURL
+		}
+		parsed, err := url.Parse(followURL)
+		if err != nil {
+			return "", fmt.Errorf("authentik login: parse flow redirect URL: %w", err)
+		}
+		// If the redirect already targets the callback, use it directly.
+		if parsed.Query().Get("code") != "" {
+			return followURL, nil
+		}
+
+		followReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, followURL, nil)
+		followResp, err := hc.Do(followReq)
+		if err != nil {
+			return "", fmt.Errorf("authentik login: follow authz redirect: %w", err)
+		}
+		followResp.Body.Close()
+		if followResp.StatusCode != http.StatusFound {
+			return "", fmt.Errorf("authentik login: expected redirect after authz flow, got %d", followResp.StatusCode)
+		}
+		next := followResp.Header.Get("Location")
+		if next == "" {
+			return "", fmt.Errorf("authentik login: missing location after authz flow redirect")
+		}
+		return next, nil
+	}
+
+	// Authentik can redirect authorization to an interactive flow URL (/if/flow/{slug}/).
+	// Drive that flow through the executor API until we receive a callback redirect with code.
+	for i := 0; i < 6 && strings.Contains(location, "/if/flow/"); i++ {
+		locURL, err := url.Parse(location)
+		if err != nil {
+			return nil, fmt.Errorf("authentik login: parse authz flow location: %w", err)
+		}
+
+		pathParts := strings.Split(strings.Trim(locURL.Path, "/"), "/")
+		flowSlug := ""
+		if len(pathParts) >= 3 {
+			flowSlug = pathParts[2]
+		}
+		if flowSlug == "" {
+			return nil, fmt.Errorf("authentik login: cannot extract flow slug from %q", location)
+		}
+
+		executorURL := fmt.Sprintf("%s/api/v3/flows/executor/%s/", base, flowSlug)
+		if locURL.RawQuery != "" {
+			executorURL += "?" + locURL.RawQuery
+		}
+
+		execReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, executorURL, nil)
+		execReq.Header.Set("Accept", "application/json")
+		execResp, err := hc.Do(execReq)
+		if err != nil {
+			return nil, fmt.Errorf("authentik login: authz executor get: %w", err)
+		}
+		execBody, _ := io.ReadAll(execResp.Body)
+		execResp.Body.Close()
+
+		if execResp.StatusCode == http.StatusFound {
+			location = execResp.Header.Get("Location")
+			if location == "" {
+				return nil, fmt.Errorf("authentik login: authz executor redirect missing location")
+			}
+			continue
+		}
+		if execResp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("authentik login: authz executor status %d: %s", execResp.StatusCode, string(execBody))
+		}
+
+		var challenge struct {
+			Component string         `json:"component"`
+			To        string         `json:"to"`
+			Token     string         `json:"token"`
+			Errors    map[string]any `json:"response_errors"`
+		}
+		if err := json.Unmarshal(execBody, &challenge); err != nil {
+			return nil, fmt.Errorf("authentik login: parse authz challenge: %w", err)
+		}
+
+		switch challenge.Component {
+		case "xak-flow-redirect":
+			location, err = handleFlowRedirect(challenge.To)
+			if err != nil {
+				return nil, err
+			}
+
+		case "ak-stage-consent":
+			csrfToken := ""
+			baseURL, _ := url.Parse(base + "/")
+			for _, ck := range jar.Cookies(baseURL) {
+				if ck.Name == "authentik_csrf" {
+					csrfToken = ck.Value
+					break
+				}
+			}
+			if csrfToken == "" {
+				return nil, fmt.Errorf("authentik login: missing authentik_csrf cookie for consent")
+			}
+
+			consentPayload, _ := json.Marshal(map[string]any{
+				"token": challenge.Token,
+			})
+			consentReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, execResp.Request.URL.String(),
+				strings.NewReader(string(consentPayload)))
+			consentReq.Header.Set("Accept", "application/json")
+			consentReq.Header.Set("Content-Type", "application/json")
+			consentReq.Header.Set("X-Authentik-Csrf", csrfToken)
+			consentResp, err := hc.Do(consentReq)
+			if err != nil {
+				return nil, fmt.Errorf("authentik login: consent post: %w", err)
+			}
+			consentBody, _ := io.ReadAll(consentResp.Body)
+			consentResp.Body.Close()
+
+			if consentResp.StatusCode == http.StatusFound {
+				location = consentResp.Header.Get("Location")
+				if location == "" {
+					return nil, fmt.Errorf("authentik login: consent redirect missing location")
+				}
+				continue
+			}
+			if consentResp.StatusCode != http.StatusOK {
+				return nil, fmt.Errorf("authentik login: consent status %d: %s", consentResp.StatusCode, string(consentBody))
+			}
+
+			var consentResult struct {
+				Component string         `json:"component"`
+				To        string         `json:"to"`
+				Errors    map[string]any `json:"response_errors"`
+			}
+			if err := json.Unmarshal(consentBody, &consentResult); err != nil {
+				return nil, fmt.Errorf("authentik login: parse consent result: %w", err)
+			}
+			if consentResult.Component != "xak-flow-redirect" {
+				return nil, fmt.Errorf("authentik login: consent returned %q: %s", consentResult.Component, string(consentBody))
+			}
+			location, err = handleFlowRedirect(consentResult.To)
+			if err != nil {
+				return nil, fmt.Errorf("authentik login: authorization after consent: %w", err)
+			}
+
+		default:
+			return nil, fmt.Errorf("authentik login: unexpected stage in authz flow: %q", challenge.Component)
+		}
+	}
+
+	if strings.Contains(location, "/if/flow/") {
+		return nil, fmt.Errorf("authentik login: authorization flow did not complete: %s", location)
+	}
+
 	locURL, err := url.Parse(location)
 	if err != nil {
 		return nil, fmt.Errorf("authentik login: parse redirect URL: %w", err)
@@ -901,7 +1139,11 @@ func (c *Client) Login(ctx context.Context, username, password string) (*domain.
 		"redirect_uri":  {redirectURI},
 		"code_verifier": {codeVerifier},
 	}
-	req, err = http.NewRequestWithContext(ctx, http.MethodPost, ep.tokenEndpoint,
+	tokenEndpoint := ep.internalTokenEndpoint
+	if tokenEndpoint == "" {
+		tokenEndpoint = ep.tokenEndpoint
+	}
+	req, err = http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint,
 		strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("authentik login: token exchange: %w", err)
@@ -1035,7 +1277,11 @@ func (c *Client) RefreshToken(ctx context.Context, refreshToken string) (*domain
 		"refresh_token": {refreshToken},
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.tokenEndpoint,
+	tokenEndpoint := ep.internalTokenEndpoint
+	if tokenEndpoint == "" {
+		tokenEndpoint = ep.tokenEndpoint
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenEndpoint,
 		strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("authentik refresh: %w", err)
@@ -1091,10 +1337,13 @@ func (c *Client) OIDCConfig() domain.OIDCConfig {
 		authMode = "headless"
 	}
 	return domain.OIDCConfig{
-		Authority: ep.issuerURL,
-		ClientID:  ep.clientID,
-		JwksURI:   ep.jwksURI,
-		AuthMode:  authMode,
+		Authority:             ep.issuerURL,
+		ClientID:              ep.clientID,
+		JwksURI:               ep.jwksURI,
+		AuthMode:              authMode,
+		TokenEndpoint:         ep.tokenEndpoint,
+		InternalTokenEndpoint: ep.internalTokenEndpoint,
+		EndSessionEndpoint:    ep.endSessionEndpoint,
 	}
 }
 
@@ -1102,4 +1351,322 @@ func (c *Client) OIDCConfig() domain.OIDCConfig {
 func (c *Client) jwksURI() string {
 	base := strings.TrimRight(c.cfg.BaseURL, "/")
 	return fmt.Sprintf("%s/application/o/%s/jwks/", base, c.cfg.AppSlug)
+}
+
+// ChangePassword verifies currentPassword then sets newPassword via the admin API.
+func (c *Client) ChangePassword(ctx context.Context, userID, currentPassword, newPassword string) error {
+	base := strings.TrimRight(c.cfg.BaseURL, "/")
+	tok := c.cfg.BootstrapToken
+
+	// Resolve user PK from userID (sub claim is the email in user_email sub_mode).
+	userURL := fmt.Sprintf("%s/api/v3/core/users/?search=%s", base, url.QueryEscape(userID))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, userURL, nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("change password: lookup user: %w", err)
+	}
+	var userPage struct {
+		Results []struct {
+			PK       int    `json:"pk"`
+			Username string `json:"username"`
+			Email    string `json:"email"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&userPage); err != nil {
+		resp.Body.Close()
+		return fmt.Errorf("change password: decode user: %w", err)
+	}
+	resp.Body.Close()
+	if len(userPage.Results) == 0 {
+		return &domain.ErrUnauthorized{Msg: "user not found"}
+	}
+	userPK := userPage.Results[0].PK
+	username := userPage.Results[0].Username
+
+	// Verify current password by driving the authentication flow.
+	jar, _ := cookiejar.New(nil)
+	hc := &http.Client{Timeout: 15 * time.Second, Jar: jar}
+	flowURL := base + "/api/v3/flows/executor/kleff-headless-auth/"
+
+	startReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, flowURL+"?next=%2F", nil)
+	startReq.Header.Set("Accept", "application/json")
+	startResp, err := hc.Do(startReq)
+	if err != nil {
+		return fmt.Errorf("change password: start flow: %w", err)
+	}
+	io.Copy(io.Discard, startResp.Body)
+	startResp.Body.Close()
+
+	uidBody, _ := json.Marshal(map[string]any{"uid_field": username})
+	uidReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, flowURL,
+		strings.NewReader(string(uidBody)))
+	uidReq.Header.Set("Accept", "application/json")
+	uidReq.Header.Set("Content-Type", "application/json")
+	uidResp, err := hc.Do(uidReq)
+	if err != nil {
+		return fmt.Errorf("change password: submit username: %w", err)
+	}
+	io.Copy(io.Discard, uidResp.Body)
+	uidResp.Body.Close()
+
+	pwBody, _ := json.Marshal(map[string]any{"password": currentPassword})
+	pwReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, flowURL,
+		strings.NewReader(string(pwBody)))
+	pwReq.Header.Set("Accept", "application/json")
+	pwReq.Header.Set("Content-Type", "application/json")
+	pwResp, err := hc.Do(pwReq)
+	if err != nil {
+		return fmt.Errorf("change password: verify current password: %w", err)
+	}
+	var flowResp struct {
+		Component string `json:"component"`
+	}
+	if err := json.NewDecoder(pwResp.Body).Decode(&flowResp); err != nil {
+		pwResp.Body.Close()
+		return fmt.Errorf("change password: parse flow response: %w", err)
+	}
+	pwResp.Body.Close()
+	if flowResp.Component == "ak-stage-password" {
+		return &domain.ErrUnauthorized{Msg: "current password is incorrect"}
+	}
+
+	// Current password verified — set the new password via admin API.
+	newPwPayload, _ := json.Marshal(map[string]any{"password": newPassword})
+	setReq, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		fmt.Sprintf("%s/api/v3/core/users/%d/set_password/", base, userPK),
+		strings.NewReader(string(newPwPayload)))
+	setReq.Header.Set("Authorization", "Bearer "+tok)
+	setReq.Header.Set("Content-Type", "application/json")
+	setResp, err := c.http.Do(setReq)
+	if err != nil {
+		return fmt.Errorf("change password: set password: %w", err)
+	}
+	body, _ := io.ReadAll(setResp.Body)
+	setResp.Body.Close()
+	if setResp.StatusCode != http.StatusNoContent && setResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("change password: set password: status %d: %s", setResp.StatusCode, string(body))
+	}
+	return nil
+}
+
+func (c *Client) ListSessions(ctx context.Context, userID string) ([]*domain.Session, error) {
+	tok := c.cfg.BootstrapToken
+
+	base := strings.TrimRight(c.cfg.BaseURL, "/")
+
+	// Resolve the Authentik user first so we can filter refresh tokens by user PK.
+	// The incoming userID can be a subject, UUID, username, or email.
+	userURL := fmt.Sprintf("%s/api/v3/core/users/?search=%s", base, url.QueryEscape(userID))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, userURL, nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list sessions: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var userPage struct {
+		Results []struct {
+			PK       int    `json:"pk"`
+			Username string `json:"username"`
+			Email    string `json:"email"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&userPage); err != nil {
+		return nil, fmt.Errorf("list sessions decode user: %w", err)
+	}
+	if len(userPage.Results) == 0 {
+		return []*domain.Session{}, nil
+	}
+	userPK := userPage.Results[0].PK
+	if userPK == 0 {
+		return []*domain.Session{}, nil
+	}
+
+	// Each refresh token carries the OIDC sid claim that Kleff uses as the browser
+	// session identity. Group by sid so revocation targets the actual app session.
+	rtURL := fmt.Sprintf("%s/api/v3/oauth2/refresh_tokens/?user=%d&page_size=200", base, userPK)
+	req, _ = http.NewRequestWithContext(ctx, http.MethodGet, rtURL, nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err = c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list sessions refresh tokens: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var rtPage struct {
+		Results []struct {
+			PK        int    `json:"pk"`
+			IDToken   string `json:"id_token"`
+			Expires   string `json:"expires"`
+			Revoked   bool   `json:"revoked"`
+			IsExpired bool   `json:"is_expired"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rtPage); err != nil {
+		return nil, fmt.Errorf("list sessions decode refresh tokens: %w", err)
+	}
+
+	sessionBySID := map[string]*domain.Session{}
+	for _, rt := range rtPage.Results {
+		if rt.Revoked || rt.IsExpired || rt.IDToken == "" {
+			continue
+		}
+		idClaims, err := parseSessionClaims(rt.IDToken)
+		if err != nil || idClaims.SID == "" {
+			continue
+		}
+		startedAt := int64(0)
+		if idClaims.AuthTime > 0 {
+			startedAt = idClaims.AuthTime * 1000
+		} else if idClaims.IssuedAt > 0 {
+			startedAt = idClaims.IssuedAt * 1000
+		}
+		lastSeen := startedAt
+		if existing, ok := sessionBySID[idClaims.SID]; ok {
+			if existing.LastSeen < lastSeen {
+				existing.LastSeen = lastSeen
+			}
+			if existing.Started == 0 || (startedAt > 0 && startedAt < existing.Started) {
+				existing.Started = startedAt
+			}
+			continue
+		}
+		browser := "Kleff Session"
+		if browser == "" {
+			browser = "Kleff Session"
+		}
+		sessionBySID[idClaims.SID] = &domain.Session{
+			ID:        idClaims.SID,
+			IPAddress: "Unknown",
+			Browser:   browser,
+			LastSeen:  lastSeen,
+			Started:   startedAt,
+		}
+	}
+
+	sessions := make([]*domain.Session, 0, len(sessionBySID))
+	for _, sess := range sessionBySID {
+		sessions = append(sessions, sess)
+	}
+	return sessions, nil
+}
+
+func (c *Client) RevokeSession(ctx context.Context, userID, sessionID string) error {
+	tok := c.cfg.BootstrapToken
+
+	base := strings.TrimRight(c.cfg.BaseURL, "/")
+
+	userURL := fmt.Sprintf("%s/api/v3/core/users/?search=%s", base, url.QueryEscape(userID))
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, userURL, nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("revoke session resolve user: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var userPage struct {
+		Results []struct {
+			PK int `json:"pk"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&userPage); err != nil {
+		return fmt.Errorf("revoke session decode user: %w", err)
+	}
+	if len(userPage.Results) == 0 || userPage.Results[0].PK == 0 {
+		c.revokeSessionLocally(sessionID, 10*time.Minute)
+		return nil
+	}
+
+	rtURL := fmt.Sprintf("%s/api/v3/oauth2/refresh_tokens/?user=%d&page_size=200", base, userPage.Results[0].PK)
+	req, _ = http.NewRequestWithContext(ctx, http.MethodGet, rtURL, nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err = c.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("revoke session list refresh tokens: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var rtPage struct {
+		Results []struct {
+			PK      int    `json:"pk"`
+			IDToken string `json:"id_token"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rtPage); err != nil {
+		return fmt.Errorf("revoke session decode refresh tokens: %w", err)
+	}
+
+	for _, rt := range rtPage.Results {
+		if rt.PK == 0 || rt.IDToken == "" {
+			continue
+		}
+		idClaims, err := parseSessionClaims(rt.IDToken)
+		if err != nil || idClaims.SID != sessionID {
+			continue
+		}
+		deleteURL := fmt.Sprintf("%s/api/v3/oauth2/refresh_tokens/%d/", base, rt.PK)
+		deleteReq, _ := http.NewRequestWithContext(ctx, http.MethodDelete, deleteURL, nil)
+		deleteReq.Header.Set("Authorization", "Bearer "+tok)
+		deleteResp, err := c.http.Do(deleteReq)
+		if err != nil {
+			return fmt.Errorf("revoke session delete refresh token %d: %w", rt.PK, err)
+		}
+		body, _ := io.ReadAll(deleteResp.Body)
+		deleteResp.Body.Close()
+		if deleteResp.StatusCode != http.StatusNoContent && deleteResp.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("revoke session delete refresh token %d: unexpected status %d: %s", rt.PK, deleteResp.StatusCode, string(body))
+		}
+	}
+
+	c.revokeSessionLocally(sessionID, 10*time.Minute)
+	return nil
+}
+
+type sessionTokenClaims struct {
+	SID      string `json:"sid"`
+	AuthTime int64  `json:"auth_time"`
+	IssuedAt int64  `json:"iat"`
+}
+
+func parseSessionClaims(raw string) (*sessionTokenClaims, error) {
+	var claims sessionTokenClaims
+	if err := json.Unmarshal([]byte(raw), &claims); err != nil {
+		return nil, err
+	}
+	return &claims, nil
+}
+
+func (c *Client) revokeSessionLocally(sessionID string, ttl time.Duration) {
+	if sessionID == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	for sid, expiresAt := range c.revokedSessions {
+		if !expiresAt.After(now) {
+			delete(c.revokedSessions, sid)
+		}
+	}
+	c.revokedSessions[sessionID] = now.Add(ttl)
+}
+
+func (c *Client) isSessionRevoked(sessionID string) bool {
+	if sessionID == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	expiresAt, ok := c.revokedSessions[sessionID]
+	if !ok {
+		return false
+	}
+	if !expiresAt.After(time.Now()) {
+		delete(c.revokedSessions, sessionID)
+		return false
+	}
+	return true
 }

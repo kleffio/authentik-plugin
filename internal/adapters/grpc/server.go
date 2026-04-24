@@ -7,9 +7,9 @@ import (
 	"strings"
 	"sync/atomic"
 
-	pluginsv1 "github.com/kleffio/plugin-sdk-go/v1"
 	"github.com/kleffio/idp-authentik/internal/core/application"
 	"github.com/kleffio/idp-authentik/internal/core/domain"
+	pluginsv1 "github.com/kleffio/plugin-sdk-go/v1"
 )
 
 // Server implements all pluginsv1 server interfaces declared by this plugin.
@@ -109,11 +109,14 @@ func (s *Server) GetOIDCConfig(_ context.Context, _ *pluginsv1.GetOIDCConfigRequ
 	cfg := s.svc.OIDCConfig()
 	return &pluginsv1.GetOIDCConfigResponse{
 		Config: &pluginsv1.OIDCConfig{
-			Authority: cfg.Authority,
-			ClientID:  cfg.ClientID,
-			JwksURI:   cfg.JwksURI,
-			Scopes:    []string{"openid", "profile", "email"},
-			AuthMode:  cfg.AuthMode,
+			Authority:             cfg.Authority,
+			ClientID:              cfg.ClientID,
+			JwksURI:               cfg.JwksURI,
+			Scopes:                []string{"openid", "profile", "email"},
+			AuthMode:              cfg.AuthMode,
+			TokenEndpoint:         cfg.TokenEndpoint,
+			InternalTokenEndpoint: cfg.InternalTokenEndpoint,
+			EndSessionEndpoint:    cfg.EndSessionEndpoint,
 		},
 	}, nil
 }
@@ -131,6 +134,13 @@ func (s *Server) EnsureAdmin(ctx context.Context, _ *pluginsv1.EnsureAdminReques
 		return &pluginsv1.EnsureAdminResponse{Error: toPluginError(err)}, nil
 	}
 	return &pluginsv1.EnsureAdminResponse{}, nil
+}
+
+func (s *Server) ChangePassword(ctx context.Context, req *pluginsv1.ChangePasswordRequest) (*pluginsv1.ChangePasswordResponse, error) {
+	if err := s.svc.ChangePassword(ctx, req.UserID, req.CurrentPassword, req.NewPassword); err != nil {
+		return &pluginsv1.ChangePasswordResponse{Error: toPluginError(err)}, nil
+	}
+	return &pluginsv1.ChangePasswordResponse{}, nil
 }
 
 // ── PluginUI ──────────────────────────────────────────────────────────────────
@@ -172,4 +182,30 @@ func toPluginError(err error) *pluginsv1.PluginError {
 	default:
 		return &pluginsv1.PluginError{Code: pluginsv1.ErrorCodeInternal, Message: err.Error()}
 	}
+}
+
+func (s *Server) ListSessions(ctx context.Context, req *pluginsv1.ListSessionsRequest) (*pluginsv1.ListSessionsResponse, error) {
+	sessions, err := s.svc.ListSessions(ctx, req.UserID)
+	if err != nil {
+		return &pluginsv1.ListSessionsResponse{Error: toPluginError(err)}, nil
+	}
+	res := make([]*pluginsv1.Session, len(sessions))
+	for i, sess := range sessions {
+		res[i] = &pluginsv1.Session{
+			ID:         sess.ID,
+			IPAddress:  sess.IPAddress,
+			UserAgent:  sess.Browser,
+			StartedAt:  sess.Started,
+			LastAccess: sess.LastSeen,
+			Current:    sess.ID == req.CurrentSessionID,
+		}
+	}
+	return &pluginsv1.ListSessionsResponse{Sessions: res}, nil
+}
+
+func (s *Server) RevokeSession(ctx context.Context, req *pluginsv1.RevokeSessionRequest) (*pluginsv1.RevokeSessionResponse, error) {
+	if err := s.svc.RevokeSession(ctx, req.UserID, req.SessionID); err != nil {
+		return &pluginsv1.RevokeSessionResponse{Error: toPluginError(err)}, nil
+	}
+	return &pluginsv1.RevokeSessionResponse{}, nil
 }

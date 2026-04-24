@@ -84,6 +84,9 @@ func (c *Client) ValidateToken(ctx context.Context, rawToken string) (*domain.To
 
 	var claims struct {
 		Sub               string   `json:"sub"`
+		SID               string   `json:"sid"`
+		Iss               string   `json:"iss"`
+		Aud               any      `json:"aud"` // string or []string per RFC 7519
 		Email             string   `json:"email"`
 		PreferredUsername string   `json:"preferred_username"`
 		Name              string   `json:"name"`
@@ -99,6 +102,36 @@ func (c *Client) ValidateToken(ctx context.Context, rawToken string) (*domain.To
 	}
 	if claims.Exp > 0 && time.Now().Unix() > claims.Exp {
 		return nil, &domain.ErrUnauthorized{Msg: "token expired"}
+	}
+	c.mu.RLock()
+	expectedIss := c.ep.tokenIssuer
+	if expectedIss == "" {
+		expectedIss = c.ep.issuerURL
+	}
+	expectedClientID := c.ep.clientID
+	c.mu.RUnlock()
+	if expectedIss != "" && claims.Iss != expectedIss {
+		return nil, &domain.ErrUnauthorized{Msg: "invalid token issuer"}
+	}
+	if expectedClientID != "" {
+		audOK := false
+		switch v := claims.Aud.(type) {
+		case string:
+			audOK = v == expectedClientID
+		case []any:
+			for _, a := range v {
+				if s, ok := a.(string); ok && s == expectedClientID {
+					audOK = true
+					break
+				}
+			}
+		}
+		if !audOK {
+			return nil, &domain.ErrUnauthorized{Msg: "invalid token audience"}
+		}
+	}
+	if c.isSessionRevoked(claims.SID) {
+		return nil, &domain.ErrUnauthorized{Msg: "session revoked"}
 	}
 
 	username := claims.PreferredUsername
