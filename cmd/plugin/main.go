@@ -61,9 +61,10 @@ func main() {
 	}
 
 	gs := grpc.NewServer(serverOpts...)
-	pluginsv1.RegisterIdentityPluginServer(gs, srv)
+	pluginsv1.RegisterIdentityProviderServer(gs, srv)
+	pluginsv1.RegisterIdentityFrameworkServer(gs, srv)
 	pluginsv1.RegisterPluginHealthServer(gs, srv)
-	pluginsv1.RegisterPluginUIServer(gs, srv)
+	pluginsv1.RegisterUIManifestServiceServer(gs, srv)
 
 	port := env("PLUGIN_PORT", "50051")
 	lis, err := net.Listen("tcp", ":"+port)
